@@ -26,16 +26,16 @@
   - OpenCV, собранный с поддержкой GStreamer
   - Пакеты GStreamer и `libcamerasrc` (обычно идут через `libcamera`)
 
-Установить зависимости из репозитория:
+Установить зависимости на Raspberry Pi через `apt`:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+sudo apt update
+sudo apt install -y \
+  python3-opencv python3-numpy python3-pyserial \
+  python3-picamera2
 ```
 
-> На Raspberry Pi `picamera2` лучше ставить через `apt` (официальный пакет),
-> чтобы работать с libcamera нативно.
+Если запускаете не на Raspberry Pi, можно использовать `pip install -r requirements.txt`.
 
 ## Быстрый старт
 

@@ -17,6 +17,8 @@ import logging
 import math
 import os
 from pathlib import Path
+import shlex
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -86,11 +88,46 @@ class CameraManager:
         self.picam_id = None
         self.picam_resolution = None
         self.lock = threading.Lock()
+        self.libcamera_available = self._detect_libcamera_tools()
+        self.libcamera_error_reported = False
+
+    def _detect_libcamera_tools(self):
+        try:
+            return subprocess.run(
+                ["libcamera-still", "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            ).returncode == 0
+        except Exception:
+            return False
 
     def list_cameras(self):
         if self.picamera2_cls:
             return self._list_cameras_picamera2()
+        if self.libcamera_available:
+            return self._list_cameras_libcamera()
         return self._list_video_devices_opencv()
+
+    def _list_cameras_libcamera(self):
+        try:
+            proc = subprocess.run(
+                ["libcamera-hello", "--list-cameras"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            cameras = []
+            for line in text.splitlines():
+                if "/" in line and ":" in line and "-" in line:
+                    cam_id = str(len(cameras))
+                    cameras.append((cam_id, f"Camera {cam_id}: {line.strip()}"))
+            return cameras or [("0", "Camera 0: libcamera")]
+        except Exception:
+            return [("0", "Camera 0: libcamera")]
 
     def _list_cameras_picamera2(self):
         infos = self.picamera2_cls.global_camera_info()
@@ -164,9 +201,16 @@ class CameraManager:
                     return frame
                 except Exception as exc:
                     self.logger.info("Picamera2 snap failed: %s", exc)
-                    return None
+                    if not self.libcamera_available:
+                        return None
+            if self.libcamera_available:
+                frame = self._snap_libcamera(cam_id, width, height)
+                if frame is not None:
+                    return frame
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
             cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            if isinstance(cam_arg, int) and os.name != "nt" and not os.path.exists(f"/dev/video{cam_arg}"):
+                return None
             cap = cv2.VideoCapture(cam_arg, backend)
             cap.set(3, width)
             cap.set(4, height)
@@ -184,9 +228,14 @@ class CameraManager:
                     return True
                 except Exception as exc:
                     self.logger.info("Picamera2 warm up failed: %s", exc)
-                    return False
+                    if not self.libcamera_available:
+                        return False
+            if self.libcamera_available:
+                return self._warm_up_libcamera(cam_id, width, height)
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
             cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            if isinstance(cam_arg, int) and os.name != "nt" and not os.path.exists(f"/dev/video{cam_arg}"):
+                return False
             cap = cv2.VideoCapture(cam_arg, backend)
             if not cap.isOpened():
                 return False
@@ -208,15 +257,65 @@ class CameraManager:
                     return True
                 except Exception as exc:
                     self.logger.info("Picamera2 exposure failed: %s", exc)
-                    return False
+                    if not self.libcamera_available:
+                        return False
+            if self.libcamera_available:
+                # Для libcamera-still экспозиция задаётся на уровне команды захвата.
+                return True
             backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
             cam_arg = int(cam_id) if str(cam_id).isdigit() else cam_id
+            if isinstance(cam_arg, int) and os.name != "nt" and not os.path.exists(f"/dev/video{cam_arg}"):
+                return False
             cap = cv2.VideoCapture(cam_arg, backend)
             if not cap.isOpened():
                 return False
             cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
             cap.release()
             return True
+
+    def _warm_up_libcamera(self, cam_id, width, height):
+        frame = self._snap_libcamera(cam_id, width, height, timeout_ms=600)
+        return frame is not None
+
+    def _snap_libcamera(self, cam_id, width, height, timeout_ms=250):
+        cmd = [
+            "libcamera-still",
+            "-n",
+            "--camera",
+            str(cam_id),
+            "--width",
+            str(width),
+            "--height",
+            str(height),
+            "--timeout",
+            str(timeout_ms),
+            "--encoding",
+            "jpg",
+            "-o",
+            "-",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=max(3, timeout_ms / 1000 + 2),
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                if not self.libcamera_error_reported:
+                    self.logger.info("libcamera-still failed: %s", (proc.stderr or b"").decode(errors="ignore").strip())
+                    self.libcamera_error_reported = True
+                return None
+            arr = np.frombuffer(proc.stdout, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return frame
+        except Exception as exc:
+            if not self.libcamera_error_reported:
+                pretty_cmd = " ".join(shlex.quote(c) for c in cmd)
+                self.logger.info("libcamera capture failed (%s): %s", pretty_cmd, exc)
+                self.libcamera_error_reported = True
+            return None
 
     def close(self):
         with self.lock:
@@ -814,9 +913,6 @@ class Scanner(QtWidgets.QMainWindow):
         btn_fov_center = QtWidgets.QPushButton("В центр на высоту")
         btn_fov_center.clicked.connect(self._move_to_fov_center)
         fov_layout.addWidget(btn_fov_center)
-        btn_fov_preview = QtWidgets.QPushButton("Вид с камеры")
-        btn_fov_preview.clicked.connect(self._open_focus_preview)
-        fov_layout.addWidget(btn_fov_preview)
         fov_layout.addStretch(1)
 
         self.fov_res_mode_combo.currentTextChanged.connect(self._on_fov_mode_changed)

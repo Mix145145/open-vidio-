@@ -43,7 +43,19 @@
 - `result/final.png`
 - `report.json` (параметры скана, шаги, FPS, файлы полос)
 
-## Запуск
+## Запуск на Raspberry Pi (без pip)
+
+```bash
+sudo apt update
+sudo apt install -y \
+  python3-opencv python3-numpy python3-pyserial \
+  python3-pyside6 python3-picamera2
+python3 main.py
+```
+
+> На Raspberry Pi рекомендуется ставить зависимости через `apt`, а не через `pip`.
+
+## Запуск на обычном Linux/Windows (если нужен pip)
 
 ```bash
 git clone https://github.com/Mix145145/open-vidio-
@@ -51,5 +63,3 @@ cd open-vidio-
 pip install -r requirements.txt
 python3 main.py
 ```
-
-> Запускайте проект без виртуального окружения (`venv`), иначе может не быть доступа к камере.
