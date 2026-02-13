@@ -34,7 +34,7 @@ ARUCO_DICT = cv2.aruco.DICT_4X4_50
 MARKER_MM = 5.3  # сторона чёрного квадрата, мм
 CAL_Z_MM = 83
 STEP_FACTOR = 0.80  # смарт-шаг = 0.80 × FOV  (≈ 20 %)
-CONFIG_FILE = "aruco_calib.json"
+CONFIG_FILE = "config.json"
 DEFAULT_RESOLUTION = "2028x1520"
 RESOLUTION_PRESETS = {
     "FHD": "1920x1080",
@@ -479,6 +479,13 @@ class Scanner(QtWidgets.QMainWindow):
             RESOLUTION_PRESETS["2K"]: {"fovX": 30.0, "fovY": 17.0},
             RESOLUTION_PRESETS["4K"]: {"fovX": 30.0, "fovY": 17.0},
         }
+        self.default_overlap_mm = 4.0
+        self.slice_width_px = 12
+        self.slice_offset_px = 0
+        self.capture_fps = 30.0
+        self.y_start = 0.0
+        self.x_start = 0.0
+        self.stabilization_enabled = True
 
         self.ser = None
         self.frames = []
@@ -486,6 +493,8 @@ class Scanner(QtWidgets.QMainWindow):
         self.grid_rows = 0
         self.positions = []
         self.stitched = None
+        self.scan_stop_requested = False
+        self.last_scan_dir = None
 
         self._load_config()
         self._build_ui()
@@ -519,6 +528,13 @@ class Scanner(QtWidgets.QMainWindow):
                         "fovY": float(values.get("fovY", self.fov_profiles.get(res, {}).get("fovY", 17.0))),
                     }
                 self.fov_move_equals_step = bool(data.get("fov_move_equals_step", True))
+                self.default_overlap_mm = float(data.get("default_overlap_mm", self.default_overlap_mm))
+                self.slice_width_px = int(data.get("slice_width_px", self.slice_width_px))
+                self.slice_offset_px = int(data.get("slice_offset_px", self.slice_offset_px))
+                self.capture_fps = float(data.get("capture_fps", self.capture_fps))
+                self.y_start = float(data.get("y_start", self.y_start))
+                self.x_start = float(data.get("x_start", self.x_start))
+                self.stabilization_enabled = bool(data.get("stabilization_enabled", self.stabilization_enabled))
                 self._apply_fov_profile_for_resolution(self.resolution)
             except Exception:
                 self.logger.info("Не удалось прочитать конфиг, использую значения по умолчанию")
@@ -551,6 +567,13 @@ class Scanner(QtWidgets.QMainWindow):
                         "selected_focus_profile": self.focus_profile,
                         "fov_profiles": self.fov_profiles,
                         "fov_move_equals_step": self.fov_move_equals_step,
+                        "default_overlap_mm": self.default_overlap_mm,
+                        "slice_width_px": self.slice_width_px,
+                        "slice_offset_px": self.slice_offset_px,
+                        "capture_fps": self.capture_fps,
+                        "x_start": self.x_start,
+                        "y_start": self.y_start,
+                        "stabilization_enabled": self.stabilization_enabled,
                     },
                     fp,
                     indent=2,
@@ -631,11 +654,44 @@ class Scanner(QtWidgets.QMainWindow):
         settings_row.addWidget(self.feed_edit)
         settings_row.addStretch(1)
 
+        strip_row = QtWidgets.QHBoxLayout()
+        scan_layout.addLayout(strip_row)
+        strip_row.addWidget(QtWidgets.QLabel("X0,Y0"))
+        self.scan_x0_edit = QtWidgets.QLineEdit(f"{self.x_start:.2f}")
+        self.scan_y0_edit = QtWidgets.QLineEdit(f"{self.y_start:.2f}")
+        self.scan_x0_edit.setFixedWidth(70)
+        self.scan_y0_edit.setFixedWidth(70)
+        strip_row.addWidget(self.scan_x0_edit)
+        strip_row.addWidget(self.scan_y0_edit)
+        strip_row.addWidget(QtWidgets.QLabel("Overlap X (мм)"))
+        self.overlap_edit = QtWidgets.QLineEdit(f"{self.default_overlap_mm:.2f}")
+        self.overlap_edit.setFixedWidth(70)
+        strip_row.addWidget(self.overlap_edit)
+        strip_row.addWidget(QtWidgets.QLabel("slice px"))
+        self.slice_width_edit = QtWidgets.QLineEdit(str(self.slice_width_px))
+        self.slice_width_edit.setFixedWidth(60)
+        strip_row.addWidget(self.slice_width_edit)
+        strip_row.addWidget(QtWidgets.QLabel("slice offset"))
+        self.slice_offset_edit = QtWidgets.QLineEdit(str(self.slice_offset_px))
+        self.slice_offset_edit.setFixedWidth(60)
+        strip_row.addWidget(self.slice_offset_edit)
+        strip_row.addWidget(QtWidgets.QLabel("FPS"))
+        self.fps_edit = QtWidgets.QLineEdit(f"{self.capture_fps:.1f}")
+        self.fps_edit.setFixedWidth(60)
+        strip_row.addWidget(self.fps_edit)
+        self.stab_checkbox = QtWidgets.QCheckBox("Стабилизация X")
+        self.stab_checkbox.setChecked(self.stabilization_enabled)
+        strip_row.addWidget(self.stab_checkbox)
+        strip_row.addStretch(1)
+
         control_row = QtWidgets.QHBoxLayout()
         scan_layout.addLayout(control_row)
         self.btn_scan = QtWidgets.QPushButton("Scan")
         self.btn_scan.clicked.connect(self._start_scan)
         control_row.addWidget(self.btn_scan)
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_stop.clicked.connect(self._stop_scan)
+        control_row.addWidget(self.btn_stop)
         btn_save = QtWidgets.QPushButton("Save")
         btn_save.clicked.connect(self._save)
         control_row.addWidget(btn_save)
@@ -1108,81 +1164,267 @@ class Scanner(QtWidgets.QMainWindow):
         self.camera_manager.set_exposure(cam, exposure, res)
 
     # ─────────── сетка ───────────
-    def _build_grid(self):
+    def _build_scan_plan(self):
         prof = self.scan_profiles.get(self.scan_profile, {"width": 0, "height": 0})
-        x0, y0 = 0.0, 0.0
-        x1, y1 = prof.get("width", 0.0), prof.get("height", 0.0)
-        sx, sy = f(self.stepx_edit.text()), f(self.stepy_edit.text())
-        cols = int((x1 - x0) / sx + 1.0001)
-        rows = int((y1 - y0) / sy + 1.0001)
-        xs = x0 + np.arange(cols) * sx
-        ys = y0 + np.arange(rows) * sy
-        self.positions = [
-            (c, r, xs[c], y)
-            for r, y in enumerate(ys)
-            for c in (range(cols) if r % 2 == 0 else reversed(range(cols)))
-        ]
-        self.grid_cols, self.grid_rows = cols, rows
-        self.grid_view.set_grid(cols, rows, f(self.fovx_edit.text()), f(self.fovy_edit.text()))
+        x_size = max(0.0, float(prof.get("width", 0.0)))
+        y_size = max(0.0, float(prof.get("height", 0.0)))
+        x0 = f(self.scan_x0_edit.text(), 0.0)
+        y0 = f(self.scan_y0_edit.text(), 0.0)
+        fov_x = f(self.fovx_edit.text(), 30.0)
+        fov_y = f(self.fovy_edit.text(), 17.0)
+        overlap = f(self.overlap_edit.text(), self.default_overlap_mm)
+        overlap = max(0.1, min(fov_x * 0.9, overlap))
+        step_x = max(0.1, fov_x - overlap)
+        strips = 1 if x_size <= fov_x else int(math.ceil((x_size - fov_x) / step_x) + 1)
+        x_positions = [x0 + i * step_x for i in range(strips)]
+        y_end = y0 + y_size
+        return {
+            "x0": x0,
+            "y0": y0,
+            "x_size": x_size,
+            "y_size": y_size,
+            "y_end": y_end,
+            "fov_x": fov_x,
+            "fov_y": fov_y,
+            "overlap": overlap,
+            "step_x": step_x,
+            "strips": strips,
+            "x_positions": x_positions,
+        }
+
+    def _build_grid(self):
+        plan = self._build_scan_plan()
+        self.grid_cols = plan["strips"]
+        self.grid_rows = 1
+        self.positions = [(i, 0, x, plan["y0"]) for i, x in enumerate(plan["x_positions"])]
+        self.grid_view.set_grid(self.grid_cols, 1, plan["fov_x"], max(plan["y_size"], plan["fov_y"]))
         self.grid_view.clear_thumbs()
+
+    def _stop_scan(self):
+        self.scan_stop_requested = True
+        self.logger.info("Stop requested")
+
+    def _record_strip_video(self, cam, resolution, out_path, feed, x, y0, y1, fps):
+        cap = cv2.VideoCapture(int(cam) if str(cam).isdigit() else cam, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        real_fps = cap.get(cv2.CAP_PROP_FPS)
+        if real_fps <= 1:
+            real_fps = fps
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, real_fps, resolution)
+        if not writer.isOpened() or not cap.isOpened():
+            cap.release()
+            writer.release()
+            raise RuntimeError("Не удалось открыть видео для записи")
+
+        if not self._g(f"G1 X{x:.2f} Y{y0:.2f} F{feed}"):
+            raise RuntimeError("Ошибка позиционирования перед полосой")
+        if not self._g("M400"):
+            raise RuntimeError("M400 error")
+
+        distance = abs(y1 - y0)
+        mm_per_sec = max(0.1, feed / 60.0)
+        duration = distance / mm_per_sec
+
+        if not self._g(f"G1 X{x:.2f} Y{y1:.2f} F{feed}"):
+            raise RuntimeError("Ошибка движения по Y")
+
+        frames_written = 0
+        started = time.time()
+        while (time.time() - started) <= (duration + 0.5):
+            ok, frame = cap.read()
+            if ok:
+                writer.write(frame)
+                frames_written += 1
+            if self.scan_stop_requested:
+                break
+        self._g("M400")
+        cap.release()
+        writer.release()
+        return max(1, frames_written), float(real_fps)
+
+    def _extract_strip_from_video(self, video_path, strip_path, y_distance_mm, slice_width_px, slice_offset_px, stabilize):
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+        cap.release()
+        if not frames:
+            raise RuntimeError(f"Видео {video_path.name} не содержит кадров")
+
+        h, w = frames[0].shape[:2]
+        slice_width_px = max(1, min(w // 3, int(slice_width_px)))
+        center = w // 2 + int(slice_offset_px)
+        left = max(0, min(w - slice_width_px, center - slice_width_px // 2))
+        right = left + slice_width_px
+
+        strips = []
+        ref_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+        ref_patch = ref_gray[:, left:right]
+        for frame in frames:
+            x_shift = 0
+            if stabilize:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                patch = gray[:, left:right]
+                r = cv2.matchTemplate(patch, ref_patch, cv2.TM_CCOEFF_NORMED)
+                _, _, _, max_loc = cv2.minMaxLoc(r)
+                x_shift = max_loc[0]
+            l = max(0, min(w - slice_width_px, left + x_shift))
+            sl = frame[:, l:l + slice_width_px].mean(axis=1)
+            strips.append(sl.astype(np.uint8))
+
+        strip_img = np.stack(strips, axis=0)
+        target_h = max(1, int(round(y_distance_mm * len(strips) / max(0.1, y_distance_mm))))
+        if target_h != strip_img.shape[0]:
+            strip_img = cv2.resize(strip_img, (strip_img.shape[1], target_h), interpolation=cv2.INTER_LINEAR)
+        cv2.imwrite(str(strip_path), strip_img)
+        return strip_img
+
+    def _align_and_blend_strips(self, strip_images, overlap_px):
+        base = strip_images[0].copy()
+        for nxt in strip_images[1:]:
+            ov = min(overlap_px, base.shape[1] - 2, nxt.shape[1] - 2)
+            ov = max(2, ov)
+            left = base[:, -ov:]
+            right = nxt[:, :ov]
+            best_shift = 0
+            best_score = -1e9
+            for shift in range(-40, 41):
+                if shift >= 0:
+                    a = left[shift:]
+                    b = right[:right.shape[0] - shift]
+                else:
+                    a = left[:left.shape[0] + shift]
+                    b = right[-shift:]
+                if a.shape[0] < 30:
+                    continue
+                score = float(np.mean((a.astype(np.float32) - b.astype(np.float32)) ** 2)) * -1.0
+                if score > best_score:
+                    best_score = score
+                    best_shift = shift
+            if best_shift > 0:
+                nxt_adj = np.pad(nxt, ((best_shift, 0), (0, 0), (0, 0)), mode="edge")
+                base_adj = np.pad(base, ((0, best_shift), (0, 0), (0, 0)), mode="edge")
+            elif best_shift < 0:
+                nxt_adj = np.pad(nxt, ((0, -best_shift), (0, 0), (0, 0)), mode="edge")
+                base_adj = np.pad(base, ((-best_shift, 0), (0, 0), (0, 0)), mode="edge")
+            else:
+                nxt_adj = nxt
+                base_adj = base
+            alpha = np.linspace(0, 1, ov, dtype=np.float32)[None, :, None]
+            blend_zone = (base_adj[:, -ov:].astype(np.float32) * (1 - alpha) + nxt_adj[:, :ov].astype(np.float32) * alpha).astype(np.uint8)
+            base = np.concatenate([base_adj[:, :-ov], blend_zone, nxt_adj[:, ov:]], axis=1)
+        return base
 
     # ─────────── сканирование ───────────
     def _start_scan(self):
         if self.btn_scan:
             self.btn_scan.setEnabled(False)
+        self.scan_stop_requested = False
         threading.Thread(target=self._scan, daemon=True).start()
 
     def _scan(self):
-        scan_dir = None
-        frames_dir = None
         try:
             if not (self.ser and self.ser.is_open):
                 self._notify("warn", "Serial", "not connected")
                 return
             self._build_grid()
-            self.frames.clear()
+            plan = self._build_scan_plan()
             feed = int(f(self.feed_edit.text(), 1500))
             z = f(self.z_edit.text(), CAL_Z_MM)
             cam = self.cam_combo.currentData() or "0"
-            for cmd in ("G90", "G28", "M400", f"G1 Z{z:.2f} F{feed}", "M400"):
+            res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
+            fps = max(1.0, f(self.fps_edit.text(), self.capture_fps))
+            slice_width = max(1, int(f(self.slice_width_edit.text(), self.slice_width_px)))
+            slice_offset = int(f(self.slice_offset_edit.text(), self.slice_offset_px))
+            stabilize = self.stab_checkbox.isChecked()
+
+            self.default_overlap_mm = plan["overlap"]
+            self.capture_fps = fps
+            self.slice_width_px = slice_width
+            self.slice_offset_px = slice_offset
+            self.x_start = plan["x0"]
+            self.y_start = plan["y0"]
+            self.stabilization_enabled = stabilize
+            self._save_config()
+
+            for cmd in ("G90", "M400", f"G1 Z{z:.2f} F{feed}", "M400"):
                 if not self._g(cmd):
                     return
-            total = len(self.positions)
-            self.progress_signal.emit(0)
-            res = parse_resolution(self.res_combo.currentText(), (1920, 1080))
-            scan_dir, frames_dir = self._prepare_scan_output()
-            shots = []
-            for i, (col, row, x, y) in enumerate(self.positions):
-                if not self._g(f"G1 X{x:.2f} Y{y:.2f} F{feed}"):
-                    continue
-                self._g("M400")
-                time.sleep(0.2)
-                frame = self.camera_manager.snap(cam, *res)
-                if frame is not None:
-                    self.frames.append((frame.copy(), col, row))
-                    image = cv_to_qimage(frame)
-                    self.thumb_signal.emit(image, col, row)
-                    frame_name = f"frame_{i:04d}_c{col}_r{row}.png"
-                    frame_path = frames_dir / frame_name
-                    cv2.imwrite(str(frame_path), frame)
-                    shots.append(
-                        {
-                            "index": i,
-                            "col": col,
-                            "row": row,
-                            "x": x,
-                            "y": y,
-                            "file": str(frame_path.relative_to(scan_dir)),
-                        }
-                    )
-                else:
-                    self.logger.info("Empty frame at %s,%s", col, row)
+
+            scan_dir, _ = self._prepare_scan_output()
+            self.last_scan_dir = scan_dir
+            raw_dir = scan_dir / "raw"
+            strips_dir = scan_dir / "strips"
+            result_dir = scan_dir / "result"
+            raw_dir.mkdir(exist_ok=True)
+            strips_dir.mkdir(exist_ok=True)
+            result_dir.mkdir(exist_ok=True)
+
+            strip_images = []
+            report = {
+                "resolution": self.res_combo.currentText(),
+                "scan": plan,
+                "fps_requested": fps,
+                "slice_width_px": slice_width,
+                "slice_offset_px": slice_offset,
+                "stabilization": stabilize,
+                "strips": [],
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            total = max(1, plan["strips"])
+            for i, x in enumerate(plan["x_positions"]):
+                if self.scan_stop_requested:
+                    break
+                self.logger.info("Полоса %s/%s: X=%.2f", i + 1, total, x)
+                video_path = raw_dir / f"strip_{i:03d}.mp4"
+                strip_path = strips_dir / f"strip_{i:03d}.png"
+                frames, real_fps = self._record_strip_video(cam, res, video_path, feed, x, plan["y0"], plan["y_end"], fps)
+                strip_img = self._extract_strip_from_video(
+                    video_path,
+                    strip_path,
+                    plan["y_size"],
+                    slice_width,
+                    slice_offset,
+                    stabilize,
+                )
+                thumb = cv2.resize(strip_img, (320, 180), interpolation=cv2.INTER_AREA)
+                self.thumb_signal.emit(cv_to_qimage(thumb), i, 0)
+                strip_images.append(strip_img)
+                report["strips"].append({
+                    "index": i,
+                    "x_mm": x,
+                    "video": str(video_path.relative_to(scan_dir)),
+                    "strip": str(strip_path.relative_to(scan_dir)),
+                    "frames": frames,
+                    "fps_actual": real_fps,
+                })
                 self.progress_signal.emit((i + 1) / total)
-            self._write_shots(scan_dir, shots)
-            self._stitch_multiband()
-            self._save_panorama_auto(scan_dir)
-            self._notify("info", "Scan", "done + stitched")
-            self.logger.info("Scan complete")
+
+            if not strip_images:
+                raise RuntimeError("Нет данных полос для сборки")
+
+            ppx = strip_images[0].shape[1] / max(0.1, plan["fov_x"])
+            overlap_px = int(round(plan["overlap"] * ppx))
+            final_img = self._align_and_blend_strips(strip_images, overlap_px)
+            final_path = result_dir / "final.png"
+            cv2.imwrite(str(final_path), final_img)
+            self.stitched = final_img
+            report["result"] = {
+                "file": str(final_path.relative_to(scan_dir)),
+                "shape": list(final_img.shape),
+                "overlap_px": overlap_px,
+            }
+            report["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(scan_dir / "report.json", "w", encoding="utf-8") as fp:
+                json.dump(report, fp, indent=2, ensure_ascii=False)
+            self.logger.info("Скан завершен: %s", final_path)
+            self._notify("info", "Scan", f"done: {final_path}")
         except Exception as exc:
             self._notify("error", "Scan", str(exc))
             self.logger.info("Scan error: %s", exc)
@@ -1193,36 +1435,10 @@ class Scanner(QtWidgets.QMainWindow):
     def _add_thumb(self, image, col, row):
         self.grid_view.set_thumb(col, row, image)
 
-    # ─────────── склейка ───────────
-    def _stitch_multiband(self):
-        fx = f(self.fovx_edit.text())
-        fy = f(self.fovy_edit.text())
-        sx = f(self.stepx_edit.text())
-        sy = f(self.stepy_edit.text())
-        cols, rows = self.grid_cols, self.grid_rows
-        if not self.frames:
-            return
-        h, w = self.frames[0][0].shape[:2]
-        ppx, ppy = w / fx, h / fy
-        width = int((cols - 1) * sx * ppx + w)
-        height = int((rows - 1) * sy * ppy + h)
-        blender = cv2.detail_MultiBandBlender()
-        blender.setNumBands(5)
-        blender.prepare((0, 0, width, height))
-        for frame, c, r in self.frames:
-            blender.feed(
-                frame.astype(np.int16),
-                255 * np.ones(frame.shape[:2], np.uint8),
-                (int(c * sx * ppx), int((rows - 1 - r) * sy * ppy)),
-            )
-        pano, _ = blender.blend(None, None)
-        self.stitched = cv2.convertScaleAbs(pano)
-
     # ─────────── save ───────────
     def _save(self):
-        self._stitch_multiband()
         if self.stitched is None:
-            self._notify("warn", "Stitch", "panorama failed")
+            self._notify("warn", "Result", "Нет итогового изображения")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save", "", "PNG (*.png);;JPEG (*.jpg *.jpeg)"
@@ -1247,6 +1463,14 @@ class Scanner(QtWidgets.QMainWindow):
         self.focus_fovy_edit.setText(self.focus_fovY)
         self.focus_step_edit.setText(self.focus_step)
         self.exposure_edit.setText(self.exposure_us)
+        if hasattr(self, "scan_x0_edit"):
+            self.scan_x0_edit.setText(f"{self.x_start:.2f}")
+            self.scan_y0_edit.setText(f"{self.y_start:.2f}")
+            self.overlap_edit.setText(f"{self.default_overlap_mm:.2f}")
+            self.slice_width_edit.setText(str(self.slice_width_px))
+            self.slice_offset_edit.setText(str(self.slice_offset_px))
+            self.fps_edit.setText(f"{self.capture_fps:.1f}")
+            self.stab_checkbox.setChecked(self.stabilization_enabled)
         if hasattr(self, "fov_profile_x_edit"):
             mode = self._mode_from_resolution(self.res_combo.currentText())
             self.fov_res_mode_combo.blockSignals(True)
@@ -1318,6 +1542,7 @@ class Scanner(QtWidgets.QMainWindow):
     def _scan_finished(self):
         if self.btn_scan:
             self.btn_scan.setEnabled(True)
+        self.scan_stop_requested = False
 
     def _prepare_scan_output(self):
         base = Path("scans")
@@ -1326,38 +1551,7 @@ class Scanner(QtWidgets.QMainWindow):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         scan_dir = base / f"{name}_{timestamp}"
         scan_dir.mkdir(parents=True, exist_ok=True)
-        frames_dir = scan_dir / "scan_frames"
-        frames_dir.mkdir(exist_ok=True)
-        return scan_dir, frames_dir
-
-    def _write_shots(self, scan_dir, shots):
-        data = {
-            "shots": shots,
-            "cols": self.grid_cols,
-            "rows": self.grid_rows,
-            "fovX": f(self.fovx_edit.text()),
-            "fovY": f(self.fovy_edit.text()),
-            "stepX": f(self.stepx_edit.text()),
-            "stepY": f(self.stepy_edit.text()),
-            "resolution": self.res_combo.currentText(),
-        }
-        with open(scan_dir / "shots.json", "w", encoding="utf-8") as fp:
-            json.dump(data, fp, indent=2, ensure_ascii=False)
-
-    def _save_panorama_auto(self, scan_dir):
-        if self.stitched is None:
-            self.logger.info("Panorama failed: stitched is None")
-            return
-        path = scan_dir / "stitched.png"
-        cv2.imwrite(str(path), self.stitched)
-        meta = {
-            "width": int(self.stitched.shape[1]),
-            "height": int(self.stitched.shape[0]),
-            "file": str(path.name),
-        }
-        with open(scan_dir / "stitch_meta.json", "w", encoding="utf-8") as fp:
-            json.dump(meta, fp, indent=2, ensure_ascii=False)
-        self.logger.info("Auto stitched panorama saved to %s", path)
+        return scan_dir, None
 
     def closeEvent(self, event):
         self._save_config()
