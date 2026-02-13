@@ -46,8 +46,10 @@
 ## Запуск
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/Mix145145/open-vidio-
+cd open-vidio-
 pip install -r requirements.txt
 python3 main.py
 ```
+
+> Запускайте проект без виртуального окружения (`venv`), иначе может не быть доступа к камере.
